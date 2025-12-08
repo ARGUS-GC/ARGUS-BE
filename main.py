@@ -20,6 +20,7 @@ from fastapi.responses import StreamingResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from psycopg2.extras import RealDictCursor
+from typing import Optional, List   
 
 # ================= 설정 (Configuration) =================
 IMAGE_DIR = "saved_images"
@@ -27,7 +28,7 @@ os.makedirs(IMAGE_DIR, exist_ok=True)
 
 # DB 설정 (Docker Compose service name: db)
 DB_CONFIG = {
-    "host": "db",  # Docker 내부라면 "db", 로컬 테스트면 "localhost"
+    "host": "localhost",  # Docker 내부라면 "db", 로컬 테스트면 "localhost"
     "database": "argus_db",
     "user": "argus_user",
     "password": "argus_password",
@@ -40,6 +41,8 @@ FIRE_MODEL_PATH = 'models/fire_classifier_resnet.pth'
 
 # [Task 4] 나홀로 작업 경고 설정
 LONE_WORKER_LIMIT = 180  # 3분 (초 단위)
+
+app = FastAPI(title="Argus Server")
 
 # CORS 설정
 app.add_middleware(
@@ -128,7 +131,7 @@ mqtt_client = mqtt.Client()
 mqtt_client.on_message = on_message
 mqtt_client.connect("localhost", 1883, 60) # Mosquitto 주소
 mqtt_client.subscribe("argus/#")   # 모든 기기의 스트림 구독
-mqtt_client.start_loop() # 별도 스레드에서 실행
+mqtt_client.loop_start() # 별도 스레드에서 실행
 
 # ================= [Thread 2] AI 분석 루프 (백그라운드) =================
 def ai_processing_loop():
