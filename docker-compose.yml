@@ -1,0 +1,25 @@
+version: '3.8'
+
+services:
+  # 1. 데이터베이스 (PostgreSQL)
+  db:
+    image: postgres:15
+    container_name: aragog_db
+    environment:
+      POSTGRES_USER: argus_user      # 코드 설정값과 일치 
+      POSTGRES_PASSWORD: argus_password
+      POSTGRES_DB: argus_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql # 테이블 자동생성
+
+  # 2. 메시지 브로커 (Mosquitto)
+  mosquitto:
+    image: eclipse-mosquitto:2
+    container_name: aragog_mqtt
+    ports:
+      - "1883:1883"     # MQTT 통신 포트
+      - "9001:9001"     # 웹소켓용 (선택)
+    volumes:
+      - ./mosquitto.conf:/mosquitto/config/mosquitto.conf
