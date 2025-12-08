@@ -1,5 +1,11 @@
+fastapi
+uvicorn
 paho-mqtt
 psycopg2-binary
 ultralytics
 opencv-python-headless
 numpy
+torch
+torchvision
+pillow
+supervision
