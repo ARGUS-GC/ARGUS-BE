@@ -6,7 +6,8 @@ import paho.mqtt.client as mqtt
 from datetime import datetime
 
 # 설정
-MQTT_BROKER = "localhost"
+#MQTT_BROKER = "localhost"
+MQTT_BROKER = "43.202.245.190"
 VIDEO_SOURCE = 0  # 0: 웹캠, "video.mp4": 동영상 파일
 DEVICE_ID = "test_cctv_01"
 
