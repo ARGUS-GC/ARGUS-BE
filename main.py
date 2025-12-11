@@ -2,7 +2,6 @@ import os
 import time
 import json
 import base64
-import uuid
 import threading
 import psycopg2
 import paho.mqtt.client as mqtt
@@ -20,15 +19,18 @@ from fastapi.responses import StreamingResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from psycopg2.extras import RealDictCursor
-from typing import Optional, List   
+from typing import Optional
 
 # ================= 설정 (Configuration) =================
+# RTSP 주소 설정
+RTSP_URL = "rtsp://hyun00:hyun0000@172.25.85.156/stream1"
+
 IMAGE_DIR = "saved_images"
 os.makedirs(IMAGE_DIR, exist_ok=True)
 
-# DB 설정 (Docker Compose service name: db)
+# DB 설정
 DB_CONFIG = {
-    "host": "localhost",  # Docker 내부라면 "db", 로컬 테스트면 "localhost"
+    "host": "localhost",
     "database": "argus_db",
     "user": "argus_user",
     "password": "argus_password",
@@ -38,18 +40,14 @@ DB_CONFIG = {
 # AI 설정
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 FIRE_MODEL_PATH = 'models/fire_classifier_resnet.pth'
-YOLO_MODEL_PATH = 'best.pt'  
+YOLO_MODEL_PATH = 'best.pt'
 
-# 클래스 ID 설정 (best.pt 기준)
 CLASS_ID_HELMET = 0
 CLASS_ID_NO_HELMET = 1
-
-# [Task 4] 나홀로 작업 경고 설정
-LONE_WORKER_LIMIT = 5  # 테스트를 위해 5초로 설정 (기존 180초)
+LONE_WORKER_LIMIT = 5
 
 app = FastAPI(title="Argus Server")
 
-# CORS 설정
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -58,14 +56,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 전역 변수 
-latest_frame_bytes = None  # 대시보드 송출용 (JPEG Bytes)
-latest_frame_cv = None     # AI 분석용 (OpenCV Image)
+# 전역 변수 (스레드 간 공유)
+latest_frame_bytes = None  # 대시보드 송출용 (JPEG)
+latest_frame_cv = None     # AI 분석용 (OpenCV BGR)
 mqtt_client = None
 
 # ================= AI 모델 로드 =================
-
-# (1) 화재 모델 (ResNet)
 def load_fire_model():
     print("🔥 화재 감지 모델 로딩 중...")
     model = models.resnet18(pretrained=False)
@@ -93,21 +89,17 @@ fire_preprocess = transforms.Compose([
     transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
 ])
 
-# 모델 초기화
 print("⏳ AI 모델 로딩 시작...")
-
-# YOLO 모델을 best.pt로 로드
 if os.path.exists(YOLO_MODEL_PATH):
     yolo_model = YOLO(YOLO_MODEL_PATH) 
     print(f"✅ PPE 모델({YOLO_MODEL_PATH}) 로드 완료")
 else:
-    print(f"⚠️ {YOLO_MODEL_PATH} 없음. 기본 yolov8n.pt 로드 (PPE 감지 불가)")
+    print(f"⚠️ {YOLO_MODEL_PATH} 없음. 기본 yolov8n.pt 로드")
     yolo_model = YOLO('yolov8n.pt') 
 
-fire_model = load_fire_model()    # 화재 감지용
+fire_model = load_fire_model()
 print("✅ AI 시스템 준비 완료")
 
-# DB 연결 함수
 def get_db_connection():
     try:
         return psycopg2.connect(**DB_CONFIG)
@@ -115,115 +107,124 @@ def get_db_connection():
         print(f"❌ DB 접속 실패: {e}")
         return None
 
-# ================= [Thread 1] MQTT 수신 (영상 받기) =================
-def on_message(client, userdata, msg):
-    global latest_frame_bytes, latest_frame_cv
+# ================= [Thread 1] RTSP 영상 수집 =================
+def capture_rtsp_stream():
+    global latest_frame_cv, latest_frame_bytes
+    print(f"🎥 RTSP 스트림 연결 시도: {RTSP_URL}")
     
-    try:
-        topic = msg.topic
-        if topic.endswith("/stream"):
-            payload = json.loads(msg.payload.decode('utf-8'))
-            img_data = base64.b64decode(payload['img_base64'])
-            
-            # 1) 대시보드 송출용
-            latest_frame_bytes = img_data
-            
-            # 2) AI 분석용 (OpenCV 변환)
-            nparr = np.frombuffer(img_data, np.uint8)
-            latest_frame_cv = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    cap = cv2.VideoCapture(RTSP_URL)
+    # 버퍼 크기를 1로 설정하여 지연 시간(Latency) 최소화
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
-    except Exception as e:
-        print(f"⚠️ MQTT 수신 에러: {e}")
+    while True:
+        if not cap.isOpened():
+            print("⚠️ RTSP 연결 끊김. 재연결 시도...")
+            cap.release()
+            time.sleep(2)
+            cap = cv2.VideoCapture(RTSP_URL)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            continue
+
+        ret, frame = cap.read()
+        if not ret:
+            print("⚠️ 프레임 수신 실패. 재연결 대기...")
+            cap.release()
+            time.sleep(1)
+            continue
+
+        # 1) AI 분석용 프레임 업데이트 (Global)
+        latest_frame_cv = frame
+
+        # 2) 웹 송출용 JPEG 인코딩 (Global)
+        ret_enc, buffer = cv2.imencode('.jpg', frame)
+        if ret_enc:
+            latest_frame_bytes = buffer.tobytes()
+        
+        # CPU 부하 조절을 위한 아주 짧은 대기
+        time.sleep(0.01)
+
+# 별도 스레드로 RTSP 캡처 실행
+threading.Thread(target=capture_rtsp_stream, daemon=True).start()
+
+
+# ================= [Thread 2] MQTT (로봇 제어용) =================
+def on_connect(client, userdata, flags, rc):
+    print("📡 MQTT Connected")
 
 mqtt_client = mqtt.Client()
-mqtt_client.on_message = on_message
-mqtt_client.connect("localhost", 1883, 60)
-mqtt_client.subscribe("argus/#")
-mqtt_client.loop_start()
+mqtt_client.on_connect = on_connect
 
-# ================= [Thread 2] AI 분석 루프 (백그라운드) =================
+try:
+    mqtt_client.connect("localhost", 1883, 60)
+    mqtt_client.loop_start()
+except Exception as e:
+    print(f"⚠️ MQTT 연결 실패: {e}")
+
+
+# ================= [Thread 3] AI 분석 루프 =================
 def ai_processing_loop():
     global latest_frame_cv
     
-    # ----------------------------------------------------
-    # [설정] Task 4: 나홀로 작업 구역 (PolygonZone) - 좌표 업데이트
-    # ----------------------------------------------------
+    # 감지 구역 정의
     polygons = [
-        np.array([[48, 222], [328, 220], [306, 612], [48, 652]]),      # Zone 1
-        np.array([[600, 100], [1000, 100], [1000, 500], [600, 500]]),  # Zone 2
-        np.array([[1100, 100], [1500, 100], [1500, 500], [1100, 500]]) # Zone 3
+        np.array([[48, 222], [328, 220], [306, 612], [48, 652]]),
+        np.array([[600, 100], [1000, 100], [1000, 500], [600, 500]]),
+        np.array([[1100, 100], [1500, 100], [1500, 500], [1100, 500]])
     ]
     zones = []
     zone_annotators = []
     zone_timers = [None] * len(polygons)
 
-    # Supervision 설정
     box_annotator = sv.BoxAnnotator(thickness=2)
     label_annotator = sv.LabelAnnotator(text_scale=0.5, text_thickness=1)
 
     for polygon in polygons:
         zone = sv.PolygonZone(polygon=polygon, triggering_anchors=[sv.Position.CENTER])
         zones.append(zone)
-        zone_annotators.append(
-            sv.PolygonZoneAnnotator(zone=zone, color=sv.Color.RED, thickness=2, text_scale=0.8)
-        )
+        zone_annotators.append(sv.PolygonZoneAnnotator(zone=zone, color=sv.Color.RED, thickness=2))
 
     last_alert_time = 0
-    
-    print("🚀 AI 분석 엔진 가동 (PPE + Lone Worker + Fire)")
+    print("🚀 AI 분석 엔진 가동 중...")
     
     while True:
+        # RTSP에서 프레임이 아직 안 들어왔으면 대기
         if latest_frame_cv is None:
             time.sleep(0.1)
             continue
             
         try:
+            # 원본 프레임 복사 (충돌 방지)
             frame = latest_frame_cv.copy()
             height, width, _ = frame.shape
             detected_events = [] 
             
-            # ==========================================================
-            # [Step 1] YOLO 추론 & 트래킹 (best.pt)
-            # ==========================================================
-            # imgsz=640 등 옵션 추가 가능
+            # --- YOLO 추론 ---
             results = yolo_model.track(frame, persist=True, verbose=False, conf=0.5)
-            
-            # Supervision Detections 변환
             detections = sv.Detections.from_ultralytics(results[0])
 
             if detections.tracker_id is not None:
-                # ------------------------------------------------------
-                # [Task A] 전역 헬멧 미착용 감지 (Global No Helmet)
-                # ------------------------------------------------------
-                # 클래스 ID 필터링: Helmet(0) or No Helmet(1)
+                # 헬멧/미착용 필터링
                 valid_detections = detections[
                     (detections.class_id == CLASS_ID_HELMET) | 
                     (detections.class_id == CLASS_ID_NO_HELMET)
                 ]
 
-                # 미착용자 필터링
-                no_helmet_detections = valid_detections[valid_detections.class_id == CLASS_ID_NO_HELMET]
-                no_helmet_count = len(no_helmet_detections)
-
+                # (A) 전역 헬멧 미착용 감지
+                no_helmet_count = len(valid_detections[valid_detections.class_id == CLASS_ID_NO_HELMET])
                 if no_helmet_count > 0:
                     detected_events.append("NO_HELMET")
                     cv2.putText(frame, f"WARNING: NO HELMET ({no_helmet_count})", (50, 50), 
                                 cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 3)
 
-                # ------------------------------------------------------
-                # [Task B] 나홀로 작업 감지 로직 (Zone Logic)
-                # ------------------------------------------------------
+                # (B) 나홀로 작업 감지
                 for i, zone in enumerate(zones):
-                    # 구역 내 사람(Helmet + No Helmet 모두 포함) 감지
                     is_inside = zone.trigger(detections=valid_detections)
                     zone_person_count = is_inside.sum()
-                    
                     status_text = "OK"
                     
                     if zone_person_count == 1:
                         if zone_timers[i] is None:
                             zone_timers[i] = time.time()
-                        
                         elapsed = time.time() - zone_timers[i]
                         if elapsed > LONE_WORKER_LIMIT:
                             detected_events.append(f"LONE_WORKER_ZONE_{i+1}")
@@ -231,36 +232,25 @@ def ai_processing_loop():
                         else:
                             status_text = f"WARN {int(elapsed)}s"
                     else:
-                        zone_timers[i] = None # 0명이나 2명 이상이면 리셋
+                        zone_timers[i] = None 
                         
-                    # 구역 그리기
                     zone_annotators[i].annotate(scene=frame)
-                    
-                    # 텍스트 표시
-                    text_pos = (polygons[i][0][0], polygons[i][0][1] - 10)
                     cv2.putText(frame, f"Z{i+1}: {zone_person_count}P {status_text}", 
-                                text_pos, cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                                (polygons[i][0][0], polygons[i][0][1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
                 
-                # ------------------------------------------------------
-                # [시각화] 바운딩 박스 & 라벨
-                # ------------------------------------------------------
+                # 시각화
                 labels = [
-                    f"{yolo_model.model.names[class_id]} {confidence:.2f}"
-                    for class_id, confidence
-                    in zip(valid_detections.class_id, valid_detections.confidence)
+                    f"{yolo_model.model.names[cid]} {conf:.2f}"
+                    for cid, conf in zip(valid_detections.class_id, valid_detections.confidence)
                 ]
                 frame = box_annotator.annotate(scene=frame, detections=valid_detections)
                 frame = label_annotator.annotate(scene=frame, detections=valid_detections, labels=labels)
 
-            # ==========================================================
-            # [Task C] 화재 감지 (ResNet Sliding Window)
-            # ==========================================================
+            # --- 화재 감지 (ResNet) ---
             if fire_model is not None:
-                # (기존 코드 유지)
                 pil_img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
                 batch_tensors = []
                 batch_coords = []
-                
                 for y in range(0, height - 256 + 1, 128):
                     for x in range(0, width - 256 + 1, 128):
                         patch = pil_img.crop((x, y, x + 256, y + 256))
@@ -273,59 +263,50 @@ def ai_processing_loop():
                         outputs = fire_model(batch_input)
                         probs = torch.nn.functional.softmax(outputs, dim=1)
                         scores, preds = torch.max(probs, 1)
-
-                        for i in range(len(preds)):
-                            if preds[i] == 1 and scores[i] > 0.8: 
+                        for k in range(len(preds)):
+                            if preds[k] == 1 and scores[k] > 0.8: 
                                 detected_events.append("FIRE")
-                                fx, fy = batch_coords[i]
+                                fx, fy = batch_coords[k]
                                 cv2.rectangle(frame, (fx, fy), (fx+256, fy+256), (0, 0, 255), 2)
                                 cv2.putText(frame, "FIRE", (fx, fy-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
-            # ==========================================================
-            # [종합] 이벤트 발생 시 DB 저장 & 로봇 명령
-            # ==========================================================
+            # --- 이벤트 발생 시 처리 ---
             if detected_events:
                 current_time = time.time()
-                # 5초 쿨다운 (중복 알림 방지)
                 if current_time - last_alert_time > 5.0: 
                     last_alert_time = current_time
                     unique_events = list(set(detected_events))
                     print(f"🚨 위험 감지: {unique_events}")
                     
-                    # 1. 파일 저장
                     timestamp_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
                     img_filename = f"{timestamp_id}.jpg"
                     save_path = os.path.join(IMAGE_DIR, img_filename)
                     cv2.imwrite(save_path, frame)
                     
-                    # 2. 로봇 명령 우선순위 결정
                     cmd_reason = "INTRUDER"
                     if "FIRE" in unique_events: cmd_reason = "FIRE"
-                    elif any("LONE_WORKER" in e for e in unique_events): cmd_reason = "LONE_WORKER"
+                    elif any("LONE" in e for e in unique_events): cmd_reason = "LONE_WORKER"
                     elif "NO_HELMET" in unique_events: cmd_reason = "PPE_VIOLATION"
                     
-                    payload = {"command": "DISPATCH", "target_zone": "Zone_A", "reason": str(unique_events)}
+                    # 로봇 명령 전송
                     if mqtt_client:
+                        payload = {"command": "DISPATCH", "target_zone": "Zone_A", "reason": str(unique_events)}
                         mqtt_client.publish("argus/robot/command", json.dumps(payload))
                     
-                    # 3. DB 저장 (통합)
+                    # DB 저장
                     conn = get_db_connection()
                     if conn:
                         try:
                             cur = conn.cursor()
-                            sql = """
-                                INSERT INTO safety_logs 
-                                (device_id, source_type, event_type, image_path, detail_info, created_at) 
-                                VALUES (%s, %s, %s, %s, %s, NOW())
-                            """
+                            sql = "INSERT INTO safety_logs (device_id, source_type, event_type, image_path, detail_info, created_at) VALUES (%s, %s, %s, %s, %s, NOW())"
                             cur.execute(sql, ("SERVER_AI", "CCTV", cmd_reason, save_path, json.dumps({"events": unique_events})))
                             conn.commit()
-                        except Exception as db_err:
-                            print(f"DB Error: {db_err}")
+                        except Exception as dbe:
+                            print(f"DB Error: {dbe}")
                         finally:
                             conn.close()
-            
-            time.sleep(0.05) 
+
+            time.sleep(0.03) # 약 30FPS 처리 속도 제한
 
         except Exception as e:
             print(f"AI Loop Error: {e}")
@@ -333,8 +314,7 @@ def ai_processing_loop():
 
 threading.Thread(target=ai_processing_loop, daemon=True).start()
 
-# ================= [Thread 3] FastAPI (대시보드 송출) =================                   
-
+# ================= FastAPI API =================
 @app.get("/video_feed")
 def video_feed():
     def iter_frames():
