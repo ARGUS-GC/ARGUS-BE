@@ -1,3 +1,4 @@
+import uvicorn
 import os
 import time
 import json
@@ -20,6 +21,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from psycopg2.extras import RealDictCursor
 from typing import Optional
+
+# os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
 
 # ================= 설정 (Configuration) =================
 # RTSP 주소 설정
@@ -167,9 +170,9 @@ def ai_processing_loop():
     
     # 감지 구역 정의
     polygons = [
-        np.array([[48, 222], [328, 220], [306, 612], [48, 652]]),
-        np.array([[600, 100], [1000, 100], [1000, 500], [600, 500]]),
-        np.array([[1100, 100], [1500, 100], [1500, 500], [1100, 500]])
+        np.array([[544, 148], [540, 550], [846, 578], [878, 170]]),   # 1번 구역
+        np.array([[910, 188], [884, 586], [1256, 616], [1326, 230]]), # 2번 구역
+        np.array([[1348, 234], [1284, 622], [1574, 636], [1646, 276]]) # 3번 구역
     ]
     zones = []
     zone_annotators = []
@@ -246,29 +249,29 @@ def ai_processing_loop():
                 frame = box_annotator.annotate(scene=frame, detections=valid_detections)
                 frame = label_annotator.annotate(scene=frame, detections=valid_detections, labels=labels)
 
-            # --- 화재 감지 (ResNet) ---
-            if fire_model is not None:
-                pil_img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-                batch_tensors = []
-                batch_coords = []
-                for y in range(0, height - 256 + 1, 128):
-                    for x in range(0, width - 256 + 1, 128):
-                        patch = pil_img.crop((x, y, x + 256, y + 256))
-                        batch_tensors.append(fire_preprocess(patch))
-                        batch_coords.append((x, y))
+            # # --- 화재 감지 (ResNet) ---
+            # if fire_model is not None:
+            #     pil_img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            #     batch_tensors = []
+            #     batch_coords = []
+            #     for y in range(0, height - 256 + 1, 128):
+            #         for x in range(0, width - 256 + 1, 128):
+            #             patch = pil_img.crop((x, y, x + 256, y + 256))
+            #             batch_tensors.append(fire_preprocess(patch))
+            #             batch_coords.append((x, y))
                 
-                if batch_tensors:
-                    batch_input = torch.stack(batch_tensors).to(DEVICE)
-                    with torch.no_grad():
-                        outputs = fire_model(batch_input)
-                        probs = torch.nn.functional.softmax(outputs, dim=1)
-                        scores, preds = torch.max(probs, 1)
-                        for k in range(len(preds)):
-                            if preds[k] == 1 and scores[k] > 0.8: 
-                                detected_events.append("FIRE")
-                                fx, fy = batch_coords[k]
-                                cv2.rectangle(frame, (fx, fy), (fx+256, fy+256), (0, 0, 255), 2)
-                                cv2.putText(frame, "FIRE", (fx, fy-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+            #     if batch_tensors:
+            #         batch_input = torch.stack(batch_tensors).to(DEVICE)
+            #         with torch.no_grad():
+            #             outputs = fire_model(batch_input)
+            #             probs = torch.nn.functional.softmax(outputs, dim=1)
+            #             scores, preds = torch.max(probs, 1)
+            #             for k in range(len(preds)):
+            #                 if preds[k] == 1 and scores[k] > 0.8: 
+            #                     detected_events.append("FIRE")
+            #                     fx, fy = batch_coords[k]
+            #                     cv2.rectangle(frame, (fx, fy), (fx+256, fy+256), (0, 0, 255), 2)
+            #                     cv2.putText(frame, "FIRE", (fx, fy-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
             # --- 이벤트 발생 시 처리 ---
             if detected_events:
@@ -283,28 +286,32 @@ def ai_processing_loop():
                     save_path = os.path.join(IMAGE_DIR, img_filename)
                     cv2.imwrite(save_path, frame)
                     
-                    cmd_reason = "INTRUDER"
+                    cmd_reason = None
+                    
                     if "FIRE" in unique_events: cmd_reason = "FIRE"
-                    elif any("LONE" in e for e in unique_events): cmd_reason = "LONE_WORKER"
+                    elif any("LONE" in e for e in unique_events):
+                        cmd_reason = next((e for e in unique_events if "LONE" in e), "LONE_WORKER")
                     elif "NO_HELMET" in unique_events: cmd_reason = "PPE_VIOLATION"
                     
-                    # 로봇 명령 전송
-                    if mqtt_client:
-                        payload = {"command": "DISPATCH", "target_zone": "Zone_A", "reason": str(unique_events)}
-                        mqtt_client.publish("argus/robot/command", json.dumps(payload))
-                    
-                    # DB 저장
-                    conn = get_db_connection()
-                    if conn:
-                        try:
-                            cur = conn.cursor()
-                            sql = "INSERT INTO safety_logs (device_id, source_type, event_type, image_path, detail_info, created_at) VALUES (%s, %s, %s, %s, %s, NOW())"
-                            cur.execute(sql, ("SERVER_AI", "CCTV", cmd_reason, save_path, json.dumps({"events": unique_events})))
-                            conn.commit()
-                        except Exception as dbe:
-                            print(f"DB Error: {dbe}")
-                        finally:
-                            conn.close()
+                    # cmd_reason이 설정된 경우에만 실행 (유효한 위험일 때만)
+                    if cmd_reason:
+                        # 로봇 명령 전송
+                        if mqtt_client:
+                            payload = {"command": "DISPATCH", "target_zone": "Zone_A", "reason": str(unique_events)}
+                            mqtt_client.publish("argus/robot/command", json.dumps(payload))
+                        
+                        # DB 저장
+                        conn = get_db_connection()
+                        if conn:
+                            try:
+                                cur = conn.cursor()
+                                sql = "INSERT INTO safety_logs (device_id, source_type, event_type, image_path, detail_info, created_at) VALUES (%s, %s, %s, %s, %s, NOW())"
+                                cur.execute(sql, ("SERVER_AI", "CCTV", cmd_reason, save_path, json.dumps({"events": unique_events})))
+                                conn.commit()
+                            except Exception as dbe:
+                                print(f"DB Error: {dbe}")
+                            finally:
+                                conn.close()
 
             time.sleep(0.03) # 약 30FPS 처리 속도 제한
 
